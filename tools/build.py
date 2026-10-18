@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Build the hangar-worlds Gazebo worlds from code.
+
+    python3 tools/build.py          # writes worlds/<name>/
+
+Every world is made of simple shapes with fixed seeds, so the output is the
+same on every run and the SDF files in the repository can be checked against
+it (CI does). Standard library only.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import shutil
+import struct
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TEXTURES = ROOT / "textures"
+OUT = ROOT / "worlds"
+
+# ArduPilot's default SITL location (Canberra Model Aircraft Club). Scenarios can set their own home.
+LOCATION = (-35.363262, 149.165237, 584.0)
+
+WHITE = (0.95, 0.95, 0.95)
+ASPHALT = (0.18, 0.18, 0.19)
+CONCRETE = (0.62, 0.62, 0.6)
+YELLOW = (0.95, 0.75, 0.1)
+RED = (0.8, 0.1, 0.1)
+BLUE = (0.1, 0.25, 0.8)
+ORANGE = (1.0, 0.45, 0.05)
+DARK = (0.05, 0.05, 0.05)
+TRUNK = (0.35, 0.22, 0.1)
+LEAVES = (0.12, 0.38, 0.12)
+
+
+# --- tiny PNG writer (no Pillow needed) -----------------------------------------
+
+
+def png(path: Path, width: int, height: int, pixel: bytes) -> None:
+    """A solid image; pixel is 1 byte (grey) or 3 bytes (RGB)."""
+    colour = {1: 0, 3: 2}[len(pixel)]
+    rows = b"".join(b"\0" + pixel * width for _ in range(height))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, colour, 0, 0, 0))
+                     + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b""))
+
+
+# --- SDF building blocks ------------------------------------------------------------
+
+
+def _f(*values: float) -> str:
+    return " ".join(f"{v:.4g}" if abs(v) >= 1e-9 else "0" for v in values)
+
+
+def material(rgb: tuple[float, float, float], transparency: float = 0.0, glow: bool = False) -> str:
+    r, g, b = rgb
+    alpha = 1 - transparency
+    emissive = f"<emissive>{_f(r * 0.45, g * 0.45, b * 0.45, 1)}</emissive>" if glow else ""
+    return (f"<material><ambient>{_f(r, g, b, alpha)}</ambient><diffuse>{_f(r, g, b, alpha)}</diffuse>"
+            f"<specular>0.1 0.1 0.1 1</specular>{emissive}</material>"
+            + (f"<transparency>{transparency:g}</transparency>" if transparency else ""))
+
+
+@dataclass
+class Shape:
+    name: str
+    geometry: str  # the inside of <geometry>
+    pose: tuple[float, float, float, float]  # x y z yaw(rad)
+    rgb: tuple[float, float, float]
+    collide: bool = True
+    transparency: float = 0.0
+    glow: bool = False
+
+    def sdf(self) -> str:
+        x, y, z, yaw = self.pose
+        pose = f"<pose>{_f(x, y, z, 0, 0, yaw)}</pose>"
+        shadows = "<cast_shadows>false</cast_shadows>" if self.transparency else ""
+        out = (f'<visual name="{self.name}_v">{pose}<geometry>{self.geometry}</geometry>'
+               f"{material(self.rgb, self.transparency, self.glow)}{shadows}</visual>")
+        if self.collide:
+            out += f'<collision name="{self.name}_c">{pose}<geometry>{self.geometry}</geometry></collision>'
+        return out
+
+
+def box(name, x, y, z_bottom, sx, sy, sz, rgb, yaw=0.0, collide=True, transparency=0.0) -> Shape:
+    return Shape(name, f"<box><size>{_f(sx, sy, sz)}</size></box>", (x, y, z_bottom + sz / 2, yaw), rgb, collide,
+                 transparency)
+
+
+def cylinder(name, x, y, z_bottom, radius, length, rgb, collide=True, transparency=0.0, glow=False) -> Shape:
+    return Shape(name, f"<cylinder><radius>{radius:g}</radius><length>{length:g}</length></cylinder>",
+                 (x, y, z_bottom + length / 2, 0), rgb, collide, transparency, glow)
+
+
+def sphere(name, x, y, z_centre, radius, rgb, collide=True) -> Shape:
+    return Shape(name, f"<sphere><radius>{radius:g}</radius></sphere>", (x, y, z_centre, 0), rgb, collide)
+
+
+@dataclass
+class Group:
+    """Static shapes that belong together, written as one model with one link."""
+
+    name: str
+    shapes: list[Shape] = field(default_factory=list)
+
+    def add(self, *shapes: Shape) -> Group:
+        self.shapes.extend(shapes)
+        return self
+
+    def sdf(self) -> str:
+        body = "\n        ".join(s.sdf() for s in self.shapes)
+        return f"""
+    <model name="{self.name}">
+      <static>true</static>
+      <link name="link">
+        {body}
+      </link>
+    </model>"""
+
+
+def tree(name: str, x: float, y: float, rng: random.Random) -> list[Shape]:
+    h = rng.uniform(5, 9)
+    return [cylinder(f"{name}_trunk", x, y, 0, 0.25, h * 0.45, TRUNK),
+            sphere(f"{name}_crown", x, y, h * 0.65, h * 0.3, LEAVES)]
+
+
+# --- world --------------------------------------------------------------------------
+
+WORLD = """<?xml version="1.0"?>
+<!-- {name}: {title}. Made by hangar-worlds (https://github.com/Enginar140/hangar-worlds), MIT.
+     Generated by tools/build.py; edit that file, not this one. Textures: ambientCG, CC0. -->
+<sdf version="1.9">
+  <world name="{name}">
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
+
+    <scene>
+      <ambient>0.6 0.6 0.6 1</ambient>
+      <background>0.7 0.8 0.95 1</background>
+      <grid>false</grid>
+      <sky></sky>
+    </scene>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 500 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.4 0.3 -0.85</direction>
+    </light>
+
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>{lat}</latitude_deg>
+      <longitude_deg>{lon}</longitude_deg>
+      <elevation>{elevation}</elevation>
+      <heading_deg>0</heading_deg>
+    </spherical_coordinates>
+
+    <!-- Ground: a flat plane for physics, a flat heightmap to tile the texture -->
+    <model name="ground">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>{ground} {ground}</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <heightmap>
+              <use_terrain_paging>false</use_terrain_paging>
+              <texture>
+                <diffuse>materials/{ground_texture}.jpg</diffuse>
+                <normal>materials/flat_normal.png</normal>
+                <size>{tile}</size>
+              </texture>
+              <uri>materials/flat.png</uri>
+              <size>{ground} {ground} 1</size>
+              <pos>0 0 -0.02</pos>
+            </heightmap>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+{models}
+  </world>
+</sdf>
+"""
+
+
+@dataclass
+class World:
+    name: str
+    title: str
+    ground: float
+    ground_texture: str
+    groups: list[Group]
+    tile: float = 6.0
+
+    def write(self) -> Path:
+        folder = OUT / self.name
+        mats = folder / "materials"
+        mats.mkdir(parents=True, exist_ok=True)
+        png(mats / "flat.png", 129, 129, b"\x00")
+        png(mats / "flat_normal.png", 8, 8, bytes((128, 128, 255)))
+        shutil.copyfile(TEXTURES / f"{self.ground_texture}.jpg", mats / f"{self.ground_texture}.jpg")
+        lat, lon, elevation = LOCATION
+        sdf = WORLD.format(name=self.name, title=self.title, lat=lat, lon=lon, elevation=elevation,
+                           ground=f"{self.ground:g}", ground_texture=self.ground_texture, tile=f"{self.tile:g}",
+                           models="".join(g.sdf() for g in self.groups))
+        path = folder / f"{self.name}.sdf"
+        path.write_text(sdf, encoding="utf-8")
+        return path
+
+
+# --- the worlds ------------------------------------------------------------------------
+
+
+def airfield() -> World:
+    """A grass airfield: 400 m x 20 m runway (east-west), taxiway, apron, hangar, windsock."""
+    rng = random.Random(1)
+    length, width = 400.0, 20.0
+    runway = Group("runway").add(box("asphalt", 0, 0, 0, length, width, 0.05, ASPHALT))
+    for i, x in enumerate(range(-int(length / 2) + 40, int(length / 2) - 40, 50)):  # centre line, 30 m dashes
+        runway.add(box(f"centre{i}", x + 15, 0, 0.05, 30, 0.9, 0.01, WHITE, collide=False))
+    for side in (-1, 1):
+        runway.add(box(f"edge{side}", 0, side * (width / 2 - 0.8), 0.05, length - 2, 0.6, 0.01, WHITE, collide=False))
+        for j in range(8):  # threshold stripes at both ends
+            y = (j - 3.5) * 2.2
+            runway.add(box(f"threshold{side}_{j}", side * (length / 2 - 18), y, 0.05, 28, 1.6, 0.01, WHITE,
+                           collide=False))
+    taxi = Group("taxiway").add(
+        box("taxiway", 0, 45, 0, 15, 70, 0.05, ASPHALT),
+        box("taxi_line", 0, 45, 0.05, 0.4, 70, 0.01, YELLOW, collide=False),
+        box("apron", 0, 110, 0, 120, 60, 0.05, CONCRETE),
+    )
+    hangar = Group("hangar").add(
+        box("walls", 0, 165, 0, 40, 30, 10, (0.55, 0.57, 0.6)),
+        box("roof", 0, 165, 10, 42, 32, 1.2, (0.3, 0.32, 0.35)),
+        box("door", 0, 149.95, 0, 30, 0.1, 8, (0.2, 0.22, 0.25), collide=False),
+    )
+    windsock = Group("windsock").add(
+        cylinder("pole", 60, 25, 0, 0.1, 6, WHITE),
+        box("sock", 61.5, 25, 5.3, 3, 0.7, 0.7, ORANGE, collide=False),
+    )
+    trees = Group("trees")
+    for k in range(40):  # around the field, clear of the runway approach
+        a = rng.uniform(0, 2 * math.pi)
+        r = rng.uniform(260, 380)
+        x, y = r * math.cos(a), r * math.sin(a)
+        if abs(y) < 60:
+            continue
+        trees.add(*tree(f"tree{k}", x, y, rng))
+    return World("airfield", "grass airfield with a 400 m runway", 3000, "grass", [runway, taxi, hangar, windsock,
+                                                                                    trees])
+
+
+def mission_arena() -> World:
+    """A 1 km x 1 km mission area: boundary posts, landing pad, ground targets, a marker
+    board and air-defence zones (visual only)."""
+    rng = random.Random(2)
+    half = 500
+    posts = Group("boundary")
+    k = 0
+    for x in range(-half, half + 1, 50):
+        for y in (-half, half):
+            for px, py in ((x, y), (y, x)):
+                posts.add(cylinder(f"post{k}", px, py, 0, 0.35, 4, RED if k % 2 else WHITE))
+                k += 1
+    for i, (x, y, sx, sy) in enumerate(((0, -half, 2 * half, 2), (0, half, 2 * half, 2),
+                                        (-half, 0, 2, 2 * half), (half, 0, 2, 2 * half))):
+        posts.add(box(f"line{i}", x, y, 0, sx, sy, 0.02, WHITE, collide=False))  # painted boundary
+    pad = Group("landing_pad").add(
+        cylinder("ring", 0, 0, 0, 10, 0.04, WHITE),
+        cylinder("pad", 0, 0, 0.04, 9.4, 0.02, CONCRETE),
+        box("h_left", -3, 0, 0.06, 1.2, 8, 0.01, WHITE, collide=False),
+        box("h_right", 3, 0, 0.06, 1.2, 8, 0.01, WHITE, collide=False),
+        box("h_bar", 0, 0, 0.06, 6, 1.2, 0.01, WHITE, collide=False),
+    )
+    targets = Group("ground_targets")
+    for i, (x, y, rgb) in enumerate(((180, 220, RED), (-260, 140, BLUE), (300, -280, RED), (-150, -320, BLUE))):
+        targets.add(box(f"target{i}", x, y, 0, 6, 3, 2, rgb, yaw=rng.uniform(0, math.pi)))
+    # a 7x7 marker board, like a large printed code on the ground
+    board = Group("marker_board").add(box("board", -320, 300, 0, 7, 7, 0.06, WHITE))
+    cell = 0.8
+    for r in range(7):
+        for c in range(7):
+            finder = (r < 3 and c < 3) or (r < 3 and c > 3) or (r > 3 and c < 3)
+            on = (r in (0, 2) or c in (0, 2) or (r == 1 and c == 1)) if finder else rng.random() < 0.5
+            if on:
+                board.add(box(f"cell{r}_{c}", -320 + (c - 3) * cell, 300 + (3 - r) * cell, 0.06, cell, cell, 0.01,
+                              DARK, collide=False))
+    zones = Group("air_defense_zones")
+    for i, (x, y, radius) in enumerate(((250, 250, 60), (-300, -100, 80), (100, -250, 50))):
+        zones.add(cylinder(f"zone{i}", x, y, 0, radius, 120, RED, collide=False, transparency=0.8, glow=True))
+    return World("mission_arena", "1 km x 1 km mission area with targets and air-defence zones", 3000, "dirt",
+                 [posts, pad, targets, board, zones], tile=8.0)
+
+
+def town() -> World:
+    """A small town: a 5 x 5 grid of blocks with streets and a central square."""
+    rng = random.Random(3)
+    block, street = 60.0, 14.0
+    pitch = block + street
+    n = 5
+    span = n * pitch
+    streets = Group("streets")
+    for i in range(n + 1):
+        offset = -span / 2 + i * pitch - street / 2
+        streets.add(box(f"street_x{i}", 0, offset, 0, span + street, street, 0.05, ASPHALT),
+                    box(f"street_y{i}", offset, 0, 0, street, span + street, 0.05, ASPHALT))
+    palette = [(0.75, 0.7, 0.62), (0.6, 0.55, 0.5), (0.8, 0.78, 0.74), (0.55, 0.6, 0.65), (0.7, 0.5, 0.42)]
+    buildings = Group("buildings")
+    square = Group("square")
+    for bx in range(n):
+        for by in range(n):
+            cx = -span / 2 + bx * pitch + block / 2
+            cy = -span / 2 + by * pitch + block / 2
+            if bx == n // 2 and by == n // 2:
+                square.add(box("plaza", cx, cy, 0, block, block, 0.05, CONCRETE),
+                           cylinder("pad_ring", cx, cy, 0.05, 8, 0.02, WHITE),
+                           cylinder("pad", cx, cy, 0.07, 7.4, 0.01, CONCRETE))
+                continue
+            for qx in (-1, 1):
+                for qy in (-1, 1):
+                    h = rng.choice((6, 9, 12, 15, 18, 24, 30))
+                    buildings.add(box(f"b{bx}{by}{qx}{qy}", cx + qx * block / 4, cy + qy * block / 4, 0,
+                                      block / 2 - 4, block / 2 - 4, h, rng.choice(palette)))
+    return World("town", "small town for copters: 5 x 5 blocks, buildings 6-30 m", 2000, "grass",
+                 [streets, buildings, square])
+
+
+WORLDS = [airfield, mission_arena, town]
+
+
+def main() -> None:
+    for make in WORLDS:
+        print("wrote", make().write().relative_to(ROOT))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: The committed worlds are what tools/build.py makes
+        run: |
+          python3 tools/build.py
+          git diff --exit-code -- worlds || (echo "::error::run python3 tools/build.py and commit the result"; exit 1)
+      - name: Every world is well-formed XML with the systems ArduPilot needs
+        run: |
+          python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as ET
+          for sdf in sorted(pathlib.Path("worlds").glob("*/*.sdf")):
+              world = ET.parse(sdf).getroot().find("world")
+              plugins = {p.get("filename") for p in world.findall("plugin")}
+              need = {"gz-sim-physics-system", "gz-sim-imu-system", "gz-sim-sensors-system"}
+              assert need <= plugins, (sdf, need - plugins)
+              assert world.find("spherical_coordinates") is not None, sdf
+              for ref in world.iter():
+                  if ref.tag in ("uri", "diffuse", "normal") and ref.text and ref.text.startswith("materials/"):
+                      assert (sdf.parent / ref.text).exists(), (sdf, ref.text)
+              print("ok", sdf)
+          PY
